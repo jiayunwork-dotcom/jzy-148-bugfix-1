@@ -3,7 +3,16 @@
 同一卡名可多次建卡，每次生成递增新版本，保留分箱、系数、分值表与训练指标。
 提供两种实现：
 * MemoryRepository：进程内字典，默认后端，pytest 使用；
-* PostgresRepository：PostgreSQL 16，版本号在事务内对同名卡加锁递增。
+* PostgresRepository：PostgreSQL 16。
+
+版本号分配（两种实现对外语义一致）：
+* 版本号在建卡完成、写入存储的那一刻按卡名分配（完成顺序），从 1 开始
+  连续递增；建卡失败的作业不占号，版本序列不留空号；
+* PostgreSQL 用 pg_advisory_xact_lock 按卡名加事务级咨询锁，把同名卡的
+  版本分配串行化；不同卡名各用各的锁，互不阻塞。内存实现用同一把锁
+  达到同样效果；
+* 存卡与更新作业状态在同一事务/临界区内完成：作业标 succeeded 时版本
+  必然已落库；作业失败时必然没有留下半截版本。
 """
 from __future__ import annotations
 
@@ -70,6 +79,16 @@ class Repository(ABC):
         ...
 
     @abstractmethod
+    def get_card_with_version(self, name: str, version: int | None = None
+                              ) -> tuple[dict[str, Any], int]:
+        """取卡并同时返回实际版本号。
+
+        缺省最新（version=None）时，版本解析与取卡在同一次存储读取中完成，
+        保证返回的版本号就是这张卡本身的版本，不会被中途插入的新版本带偏。
+        """
+        ...
+
+    @abstractmethod
     def list_versions(self, name: str) -> list[dict[str, Any]]: ...
 
     @abstractmethod
@@ -103,19 +122,22 @@ class MemoryRepository(Repository):
             self.jobs[job_id].update(
                 status="running", started_at=utcnow())
 
-    def save_card(self, card: dict[str, Any]) -> int:
-        name = card["name"]
-        with self._lock:
-            versions = self.cards.setdefault(name, [])
-            version = len(versions) + 1
-            stored = {"version": version, "created_at": utcnow(),
-                      "card": to_jsonable(card)}
-            versions.append(stored)
+    def _save_card_locked(self, card: dict[str, Any]) -> int:
+        versions = self.cards.setdefault(card["name"], [])
+        version = len(versions) + 1
+        versions.append({"version": version, "created_at": utcnow(),
+                         "card": to_jsonable(card)})
         return version
 
-    def complete_job(self, job_id: str, card: dict[str, Any]) -> int:
-        version = self.save_card(card)
+    def save_card(self, card: dict[str, Any]) -> int:
         with self._lock:
+            return self._save_card_locked(card)
+
+    def complete_job(self, job_id: str, card: dict[str, Any]) -> int:
+        # 存卡与更新作业状态在同一临界区内完成：作业标 succeeded 时版本
+        # 必然已落库，不会出现中间状态被其它线程读到
+        with self._lock:
+            version = self._save_card_locked(card)
             self.jobs[job_id].update(
                 status="succeeded", finished_at=utcnow(), version=version)
         return version
@@ -138,15 +160,21 @@ class MemoryRepository(Repository):
                     if name is None or j["card_name"] == name]
 
     def get_card(self, name: str, version: int | None = None) -> dict[str, Any]:
+        return self.get_card_with_version(name, version)[0]
+
+    def get_card_with_version(self, name: str, version: int | None = None
+                              ) -> tuple[dict[str, Any], int]:
         with self._lock:
             versions = self.cards.get(name)
             if not versions:
                 raise KeyError(f"卡 {name} 不存在")
             if version is None:
-                return dict(versions[-1]["card"])
-            if version < 1 or version > len(versions):
+                rec = versions[-1]
+            elif version < 1 or version > len(versions):
                 raise KeyError(f"卡 {name} 版本 {version} 不存在")
-            return dict(versions[version - 1]["card"])
+            else:
+                rec = versions[version - 1]
+            return dict(rec["card"]), rec["version"]
 
     def get_card_meta(self, name: str, version: int | None = None
                       ) -> dict[str, Any]:
@@ -154,7 +182,12 @@ class MemoryRepository(Repository):
             versions = self.cards.get(name)
             if not versions:
                 raise KeyError(f"卡 {name} 不存在")
-            rec = versions[-1] if version is None else versions[version - 1]
+            if version is None:
+                rec = versions[-1]
+            elif version < 1 or version > len(versions):
+                raise KeyError(f"卡 {name} 版本 {version} 不存在")
+            else:
+                rec = versions[version - 1]
             return {"card_name": name, "version": rec["version"],
                     "created_at": rec["created_at"]}
 
@@ -204,10 +237,12 @@ CREATE TABLE IF NOT EXISTS scorecards (
 class PostgresRepository(Repository):
     def __init__(self, dsn: str) -> None:
         import psycopg2
-        from psycopg2.pool import SimpleConnectionPool
+        from psycopg2.pool import ThreadedConnectionPool
 
         self._psycopg2 = psycopg2
-        self._pool = SimpleConnectionPool(1, 8, dsn)
+        # 连接池会被建卡调度线程与 HTTP 请求线程并发使用；
+        # SimpleConnectionPool 不能跨线程共享，必须用线程安全的实现
+        self._pool = ThreadedConnectionPool(1, 16, dsn)
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(SCHEMA_SQL)
@@ -226,9 +261,15 @@ class PostgresRepository(Repository):
                 return self.conn
 
             def __exit__(self, exc_type, exc, tb):
-                if exc_type is not None:
-                    self.conn.rollback()
-                self.pool.putconn(self.conn)
+                try:
+                    if exc_type is not None:
+                        self.conn.rollback()
+                    else:
+                        # 兜底提交（只读方法不显式 commit）：避免连接带着
+                        # 打开的事务回到池中（idle in transaction）
+                        self.conn.commit()
+                finally:
+                    self.pool.putconn(self.conn)
 
         return _CM(self._pool)
 
@@ -249,24 +290,37 @@ class PostgresRepository(Repository):
                 "started_at=now() WHERE job_id=%s", (job_id,))
             conn.commit()
 
+    def _insert_card_version(self, cur, card: dict[str, Any]) -> int:
+        """在调用方的事务内为同名卡分配下一版本号并插入（调用方负责提交）。
+
+        pg_advisory_xact_lock 按卡名加事务级咨询锁：同名卡的并发建卡只在
+        版本分配这一步串行，max(version)+1 不会撞号；不同卡名各用各的锁、
+        互不阻塞；锁随事务提交/回滚自动释放。
+        """
+        cur.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (card["name"],))
+        cur.execute(
+            "SELECT max(version) FROM scorecards WHERE card_name=%s",
+            (card["name"],))
+        version = (cur.fetchone()[0] or 0) + 1
+        cur.execute(
+            "INSERT INTO scorecards (card_name, version, card) "
+            "VALUES (%s,%s,%s)",
+            (card["name"], version, json.dumps(to_jsonable(card))))
+        return version
+
     def save_card(self, card: dict[str, Any]) -> int:
         with self._conn() as conn, conn.cursor() as cur:
-            # 事务行锁保证同名卡并发建卡时版本号不冲突
-            cur.execute(
-                "SELECT max(version) FROM scorecards WHERE card_name=%s "
-                "FOR UPDATE", (card["name"],))
-            latest = cur.fetchone()[0] or 0
-            version = latest + 1
-            cur.execute(
-                "INSERT INTO scorecards (card_name, version, card) "
-                "VALUES (%s,%s,%s)",
-                (card["name"], version, json.dumps(to_jsonable(card))))
+            version = self._insert_card_version(cur, card)
             conn.commit()
         return version
 
     def complete_job(self, job_id: str, card: dict[str, Any]) -> int:
-        version = self.save_card(card)
+        # 存卡与更新作业状态在同一事务提交：作业标 succeeded 时版本必然
+        # 已落库；任一语句失败整体回滚，不留半截版本
         with self._conn() as conn, conn.cursor() as cur:
+            version = self._insert_card_version(cur, card)
             cur.execute(
                 "UPDATE scorecard_jobs SET status='succeeded', "
                 "finished_at=now(), version=%s WHERE job_id=%s",
@@ -310,25 +364,28 @@ class PostgresRepository(Repository):
                 "created_at", "started_at", "finished_at")
         return [dict(zip(keys, r)) for r in rows]
 
-    def _fetch_card(self, cur, name: str, version: int | None) -> dict[str, Any]:
-        if version is None:
-            cur.execute(
-                "SELECT card FROM scorecards WHERE card_name=%s "
-                "ORDER BY version DESC LIMIT 1", (name,))
-        else:
-            cur.execute(
-                "SELECT card FROM scorecards WHERE card_name=%s AND version=%s",
-                (name, version))
-        row = cur.fetchone()
+    def get_card(self, name: str, version: int | None = None) -> dict[str, Any]:
+        return self.get_card_with_version(name, version)[0]
+
+    def get_card_with_version(self, name: str, version: int | None = None
+                              ) -> tuple[dict[str, Any], int]:
+        # 版本解析与取卡在同一条查询里完成，缺省最新时也不会被
+        # 两次读取之间提交的新版本带偏
+        with self._conn() as conn, conn.cursor() as cur:
+            if version is None:
+                cur.execute(
+                    "SELECT version, card FROM scorecards WHERE card_name=%s "
+                    "ORDER BY version DESC LIMIT 1", (name,))
+            else:
+                cur.execute(
+                    "SELECT version, card FROM scorecards "
+                    "WHERE card_name=%s AND version=%s", (name, version))
+            row = cur.fetchone()
         if row is None:
             raise KeyError(
                 f"卡 {name} 版本 {version} 不存在" if version
                 else f"卡 {name} 不存在")
-        return row[0]
-
-    def get_card(self, name: str, version: int | None = None) -> dict[str, Any]:
-        with self._conn() as conn, conn.cursor() as cur:
-            return self._fetch_card(cur, name, version)
+        return row[1], row[0]
 
     def get_card_meta(self, name: str, version: int | None = None
                       ) -> dict[str, Any]:

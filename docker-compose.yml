@@ -26,5 +26,25 @@ services:
     ports:
       - "8000:8000"
 
+  # 在真实库上跑 PostgreSQL 集成测试：
+  #   docker compose --profile test run --rm tests
+  # REQUIRE_PG_TESTS=1 时缺连接串/连不上库会直接失败，不会静默跳过。
+  tests:
+    build: .
+    profiles: ["test"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://scorecard:scorecard@db:5432/scorecard
+      REQUIRE_PG_TESTS: "1"
+      PYTHONPATH: /srv
+    volumes:
+      - ./tests:/srv/tests:ro
+      - ./pytest.ini:/srv/pytest.ini:ro
+    command: ["pytest", "-p", "no:cacheprovider", "-v",
+              "tests/test_postgres_storage.py",
+              "tests/test_postgres_integration.py"]
+
 volumes:
   pgdata:

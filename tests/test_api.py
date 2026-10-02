@@ -181,3 +181,24 @@ def test_failed_job_records_reason(client, monkeypatch):
     final = _wait_job(client, r.json()["job_id"])
     assert final["status"] == "failed"
     assert "牛顿迭代" in final["error"]
+
+
+def test_score_version_consistency_while_building_memory():
+    """边建卡边打分：响应版本必须就是实际算分用的版本（内存存储）。
+
+    与 PostgreSQL 集成测试共用同一份校验逻辑，保证两种存储对外表现一致。
+    """
+    from fastapi.testclient import TestClient
+
+    from app.api import create_app
+    from app.scheduler import JobScheduler
+    from app.storage import MemoryRepository
+    from tests.conftest import run_score_version_race
+
+    repo = MemoryRepository()
+    sched = JobScheduler(repo, max_workers=4)
+    app = create_app(repo=repo, scheduler=sched)
+    with TestClient(app) as client:
+        run_score_version_race(app, client, "race_mem",
+                               extra_pdos=(40, 60, 80), n_score_threads=4)
+    sched.shutdown()

@@ -22,7 +22,7 @@ app/
   scheduler.py  后台作业调度（线程池，作业间数据隔离）
   storage.py    版本存储（内存 / PostgreSQL）
   api.py        FastAPI 接口层
-tests/          pytest 性质测试 + 可手算小样本
+tests/          pytest 性质测试 + 可手算小样本 + PostgreSQL 集成测试
 ```
 
 ## 启动
@@ -100,6 +100,25 @@ score  = offset - factor * logit(PD)
 每箱分值 = `per_offset - factor*(intercept_share + coef*WOE)`。
 全部箱分之和即为总分；总分增加一个 PDO，odds 恰好翻倍。
 
+## 版本号与并发语义
+
+* 版本号在**建卡完成、写入存储的那一刻**按卡名分配（完成顺序），从 1
+  开始连续递增。PostgreSQL 下同名卡的版本分配由
+  `pg_advisory_xact_lock` 事务级咨询锁串行化，不同卡名各用各的锁，
+  互不阻塞；内存存储用同一把锁达到同样效果，两种后端对外表现一致。
+* 存卡与更新作业状态在**同一个事务**里提交：作业标 `succeeded` 时版本
+  必然已落库；建卡中途失败的作业不会留下半截版本，也不占号——版本
+  序列永远连续，没有空号。
+* 为什么按完成顺序而不是提交顺序分配：按提交顺序预分配时，建卡失败的
+  作业会留下永久空号（或需要墓碑版本占位）；早提交但建卡慢的作业占住
+  小号期间，"最新版本"要么回退、要么指向尚未建完的版本。按完成顺序的
+  代价是版本号不反映提交先后——晚提交的作业可能先完成而拿到更小的号；
+  但每个作业记录上的 `version` 与该版本卡里的建卡参数严格一一对应，
+  不存在错配。
+* 打分（单条/批量，缺省最新/显式指定）的版本解析与取卡在**同一次存储
+  读取**中完成，响应里的 `card_version` 就是本次实际算分用的那张卡，
+  不会被两次读取之间落库的新版本带偏。
+
 ## 在线打分
 
 ```bash
@@ -123,13 +142,27 @@ curl -X POST http://localhost:8000/score/retail_a \
 ## 测试与手算样本
 
 ```bash
-pytest
+pytest        # 内存存储：性质测试 + HTTP 接口测试
 ```
 
 覆盖性质：平均预测 PD == 实际违约率（1e-6 内）；标签整体取反后 WOE 变号、
 IV 不变；样本复制一份后分箱/WOE/系数不变；箱分之和 == 总分；总分 +PDO
 时 odds 翻倍；PD 随总分严格单调且恒在 (0,1)；数值特征 WOE 单调；
-未见类别标注；作业前拒绝；并发作业隔离；版本与批量接口。
+未见类别标注；作业前拒绝；并发作业隔离；版本与批量接口；
+边建卡边打分时响应版本 == 实际算分版本。
+
+PostgreSQL 集成测试（真实库，覆盖并发建卡与边建卡边打分）：
+
+```bash
+docker compose up -d db
+DATABASE_URL=postgresql://scorecard:scorecard@localhost:5432/scorecard \
+    pytest tests/test_postgres_storage.py tests/test_postgres_integration.py
+# 或一键在 compose 里跑：
+docker compose --profile test run --rm tests
+```
+
+未设置 `DATABASE_URL` 时这组测试跳过（`-ra` 会列出原因）；设置
+`REQUIRE_PG_TESTS=1` 后，缺连接串或连不上库会**直接失败**，不再静默跳过。
 
 `tests/data/sample_development.csv` 是 24 行小样本（8 坏 16 好），
 前两个特征 `city`、`housing` 的 WOE 可直接手算，测试
