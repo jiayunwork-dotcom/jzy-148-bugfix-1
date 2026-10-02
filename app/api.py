@@ -133,7 +133,8 @@ def create_app(repo: Repository | None = None,
     async def score(name: str, body: ScoreRequest,
                     version: int | None = Query(None)):
         try:
-            card = _repo(app).get_card(name, version)
+            # 卡与版本号一次读取确定：响应里报的版本就是算分用的那张卡
+            card, resolved = _repo(app).get_card_with_version(name, version)
         except KeyError as exc:
             raise HTTPException(404, str(exc))
         try:
@@ -143,11 +144,7 @@ def create_app(repo: Repository | None = None,
                 422, {"error": f"该申请人无法打分: {exc}",
                       "applicant": body.features})
         result["card_name"] = name
-        if version is None:
-            versions = _repo(app).list_versions(name)
-            result["card_version"] = versions[-1]["version"] if versions else None
-        else:
-            result["card_version"] = version
+        result["card_version"] = resolved
         return to_jsonable(result)
 
     @app.post("/score/{name}/batch")
@@ -155,15 +152,10 @@ def create_app(repo: Repository | None = None,
                           version: int | None = Query(None)):
         repo = _repo(app)
         try:
-            card = repo.get_card(name, version)
+            # 与单条打分相同：卡与版本号一次读取确定，整批用同一张卡
+            card, resolved = repo.get_card_with_version(name, version)
         except KeyError as exc:
             raise HTTPException(404, str(exc))
-        resolved = version
-        if resolved is None:
-            try:
-                resolved = repo.list_versions(name)[-1]["version"]
-            except IndexError:
-                raise HTTPException(404, f"卡 {name} 不存在")
 
         # 在线打分是纯 CPU 轻量计算，放到线程池避免阻塞事件循环；
         # 每条独立 try，单条出错只影响自身。
